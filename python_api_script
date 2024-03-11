@@ -1,0 +1,270 @@
+# Create Python API request
+
+import fnmatch
+import json
+import os
+import re
+from pathlib import Path
+from re import Match
+
+import requests
+from requests.auth import HTTPBasicAuth
+
+user_name = ""
+auth_token = ""
+site_url = ""
+template_page = ""
+python_home_page = ""
+groovy_home_page = ""
+auth = HTTPBasicAuth(f"{user_name}", f"{auth_token}")
+
+""" Script to create Confluence pages based on code from a directory
+
+Code scans for given directory for any subfolders and files, recursively.
+It picks up groovy and python file for later use
+Then it sends a post API call to Confluence to create a page from a template, with the title coming from the directory name
+It then reads the files and inserts the file text into the code snippet on the new page, this is done if there is a single script
+If there are multiple scripts, it adds them as attachments to the new page with a PUT API call
+Note that this script will throw an error if the directory/files already exist
+"""
+
+
+def fast_scandir(dirname):
+    """scans through the directory, recursively"""
+    subfolders = [f.path for f in os.scandir(dirname) if f.is_dir()]
+    for dirname in list(subfolders):
+        subfolders.extend(fast_scandir(dirname))
+    return subfolders
+
+
+def get_files(dirname):
+    """With the given directories adds .py and .groovy files to a list uses fnmatch to match entry"""
+    file_list = []
+    dir_list = fast_scandir(dirname)
+    for entry in os.scandir(dirname):
+        if (entry.is_file() and fnmatch.fnmatch(entry, '*.py')) or (
+                entry.is_file() and fnmatch.fnmatch(entry, '*.groovy')) or (
+                entry.is_file() and fnmatch.fnmatch(entry, '*readme*')):
+            file_list.append(entry.path)
+    for files in dir_list:
+        directory = Path(fr'{files}')
+        for entry in directory.iterdir():
+            if (entry.is_file() and fnmatch.fnmatch(entry, '*.py')) or (
+                    entry.is_file() and fnmatch.fnmatch(entry, '*.groovy')):
+                file_list.append(entry)
+    return file_list
+
+
+def find_macro(text, file_text):
+    """finds the code snippet macro and inserts the file_text from the previously found list of files"""
+    if "storage" in text:
+        text = str(text["storage"]["value"])
+    elif "view" in text:
+        text = str(text["view"]["value"])
+    pattern_start = re.search(r'CDATA\[', text)
+    pattern_end = re.search(r']]></ac:plain-text-body', text)
+    if pattern_start and pattern_end:
+        pattern_end.start()
+        pattern_start.end()
+        text = text[:(pattern_start.end())] + f"{file_text}" + text[(pattern_end.start()):]
+    return text
+
+
+def copy_page(parent_page, title):
+    # this section is the API call to create a page from a copy
+    url = f"https://{site_url}.atlassian.net/wiki/rest/api/content/{template_page}/copy?expand=body.storage"
+
+    headers = {
+        "Accept": "application/json;charset=UTF-8",
+        "Content-Type": "application/json"
+    }
+    payload = json.dumps({
+        "copyAttachments": "true",
+        "copyPermissions": "true",
+        "copyProperties": "true",
+        "copyLabels": "true",
+        "copyCustomContents": "true",
+        "destination": {
+            "type": "parent_page",
+            "value": f"{parent_page}"
+        },
+        "pageTitle": f"{title}",
+    }
+    )
+    response = requests.request(
+        "POST",
+        url,
+        data=payload,
+        headers=headers,
+        auth=auth
+    )
+    if response.status_code == 200:
+        print(response.json())
+    else:
+        raise Exception(response)
+    # Gets the ID of the newly created page
+    # gets the text of the newly created bodies page
+    id_match = next(response.json()[x] for x in response.json() if "id" in x)
+    text = dict(next(response.json()[x] for x in response.json() if "body" in x))
+    return id_match, text
+
+
+def update_page(body, page_id, parent_page, title, version):
+    update_url = f"https://{site_url}.atlassian.net/wiki/rest/api/content/{page_id}"
+    headers = {
+        "Accept": "application/json;charset=UTF-8",
+        "Content-Type": "application/json"
+    }
+    body = json.dumps({
+        "version": {
+            "number": version
+        },
+        "title": f"{title}",
+        "type": "page",
+        "status": "current",
+        "ancestors": [
+            {
+                "id": parent_page
+            }
+        ],
+        "body": {
+            "storage": {
+                "value": body,
+                "representation": "storage"
+            }
+        }})
+    update_response = requests.request(
+        "PUT",
+        update_url,
+        data=body,
+        headers=headers,
+        auth=auth
+    )
+    if update_response.status_code == 200:
+        print('Succesfully inserted text')
+    else:
+        raise Exception(update_response)
+    return update_response
+
+
+def upload_attachment(parent_id, file):
+    update_url = f"https://{site_url}.atlassian.net/wiki/rest/api/content/{parent_id}/child/attachment"
+    headers_read = {
+        "Accept": "application/json",
+        "X-Atlassian-Token": "no-check"
+    }
+    files_read = {
+        "file": open(f"{file}", 'rb')
+    }
+    read_response = requests.request(
+        "PUT",
+        update_url,
+        files=files_read,
+        headers=headers_read,
+        auth=auth
+    )
+
+    if read_response.status_code == 200:
+        print('Succesfully added attachments')
+    else:
+        raise Exception(read_response)
+
+def add_label(page_id,payload_label):
+    update_url= f"https://{site_url}.atlassian.net/wiki/rest/api/content/{page_id}/label"
+    headers = {
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+    }
+    code_label = json.dumps([
+        {
+            "prefix": "global",
+            "name": "code",
+        }
+    ])
+    payload_list = [code_label,payload_label]
+    for api in payload_list:
+        response_label = requests.request(
+         "POST",
+         update_url,
+         data=api,
+         headers=headers,
+        auth=auth
+     )
+    print(json.dumps(json.loads(response_label.text), sort_keys=True, indent=4, separators=(",", ": ")))
+
+def process_folder(dirname):
+    # opens the first file(used only if 1 file in list) to add the text as an insert
+    print(get_files(dirname))
+    with open(get_files(dirname)[0], 'r') as check:
+        file_text = str(check.read())
+    title = str(Path(fr'{dirname}').name)
+    # checks whether the files are in py or groovy to add to the appropriate parent_page
+    for x in get_files(dirname):
+        if fnmatch.fnmatch(x, '*.py'):
+            parent_page = python_home_page
+            payload_label = json.dumps([
+                {
+                    "prefix": "global",
+                    "name": "python"
+                }
+            ])
+        elif fnmatch.fnmatch(x, '*.groovy'):
+            parent_page = groovy_home_page
+            payload_label = json.dumps([
+                {
+                    "prefix": "global",
+                    "name": "groovy"
+                }
+            ])
+    page_id, text = copy_page(parent_page, title)
+    # ancestors = parent_page
+    # Checks whether there are any readme files, if there are,
+    # adds them as attachments and removes the files from file list
+    new_file_list = get_files(dirname)
+    for readme in get_files(dirname):
+        print(readme)
+        if fnmatch.fnmatch(readme, "*readme*"):
+            new_file_list.remove(readme)
+            upload_attachment(page_id, readme)
+    print(new_file_list)
+    # Checks whether there is 1 or more files, if 1 file adds text as a code snippet if > 1, adds attachments
+    # Attachments have no body due to issue with sending a file and body in the same API call for Requests module
+    if len(new_file_list) > 1:
+        print(len(new_file_list),"Would you prefer to add these scripts as separate sub-pages?")
+        response = None
+        while response not in {"yes", "no"}:
+            response = raw_input("Please enter yes or no: ")
+        if response == "no":
+            for x in new_file_list:
+                upload_attachment(page_id, x)
+        elif response == "yes":
+            parent_page = page_id
+            for file in new_file_list:
+                print(f'do you want to add this file {file} as a page or an attachment?')
+                response = None
+                while response not in {"page", "attachment"}:
+                    response = str(input("Please enter page or attachment: "))
+                    if response == "attachment":
+                        upload_attachment(parent_page, file)
+                    elif response == "page":
+                        title = str(Path(fr'{file}').name)
+                        page_id, text = copy_page(parent_page, title)
+                        version = 2
+                        with open(file, 'r') as check:
+                            file_text = str(check.read())
+                        body = f"{find_macro(text,file_text)}"
+                        add_label(page_id, payload_label)
+                        update_page(body, page_id, parent_page, title, version)
+    elif len(new_file_list) == 1:
+        version = 2
+        body = f"{find_macro(text, file_text)}"
+        update_response = update_page(body, page_id, parent_page, title, version)
+#        upload_attachment(page_id, readme)
+    print(find_macro(text, file_text))
+    print(update_response.text)
+def main():
+    dirname = str(input('Enter the folder ( with full path): '))
+    process_folder(dirname)
+
+if __name__ == "__main__":
+    main()
